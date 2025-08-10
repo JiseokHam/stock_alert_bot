@@ -1,7 +1,7 @@
 # stock_alert_bot.py
 # 소스: Google News RSS + DART(전자공시)
 # 모드: 속보 즉시 + 1시간 다이제스트(새 소식 있을 때만)
-# 수정: RSS pubDate 기반으로 최근 기사만 처리(오래된/재탕 차단)
+# 수정: 빈 다이제스트/중복 전송 방지, datetime 비교로 버그 제거
 
 import os, time, json, re, hashlib, zipfile, io, datetime as dt
 from dataclasses import dataclass
@@ -22,9 +22,13 @@ if not (OPENAI_API_KEY and TELEGRAM_TOKEN and CHAT_ID and DART_API_KEY):
 
 TZ = dt.timezone(dt.timedelta(hours=9))  # Asia/Seoul
 
+# ========= 옵션 =========
+# 모두 '중립'만 있으면 다이제스트도 보내지 않으려면 True
+SKIP_IF_ONLY_NEUTRAL = True
+
 # ========= 모니터링 종목 =========
 WATCH_LIST = [
-    "삼성전자",   # ← 테스트용 (원래 3종목은 나중에 여기로 교체/추가)
+    "삼성전자",
     # "대원산업",
     # "현대코퍼레이션홀딩스",
     # "삼지전자",
@@ -59,7 +63,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 @dataclass
 class Item:
-    ts: dt.datetime     # 게시시각
+    ts: dt.datetime     # 게시시각 (TZ 포함)
     source: str         # "news" | "dart"
     stock: str
     title: str
@@ -71,6 +75,10 @@ def now():
 
 def to_ts(d: dt.datetime | None):
     return (d or now()).strftime("%Y-%m-%d %H:%M")
+
+def iso_to_dt(s: str) -> dt.datetime:
+    # Python 3.11: fromisoformat이 TZ 포함 문자열 처리
+    return dt.datetime.fromisoformat(s)
 
 # ========= 유틸 =========
 def normalize_title(s: str) -> str:
@@ -87,6 +95,11 @@ def make_hash(title: str, url: str):
 def minutes_ago(ts: dt.datetime) -> float:
     return (now() - ts).total_seconds() / 60.0
 
+def hash_items(items: List[Item]) -> str:
+    # 같은 내용 재발송 방지용 해시
+    key = "|".join(sorted(f"{normalize_title(i.title)}|{i.url}" for i in items))
+    return hashlib.md5(key.encode("utf-8")).hexdigest()
+
 # ========= 텔레그램 =========
 def send_telegram(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -101,7 +114,7 @@ def load_state():
     if os.path.exists(STATE_PATH):
         with open(STATE_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {"seen_hashes": [], "digest_buffer": [], "last_digest_unix": 0}
+    return {"seen_hashes": [], "digest_buffer": [], "last_digest_unix": 0, "last_digest_hash": ""}
 
 def save_state(state):
     with open(STATE_PATH, "w", encoding="utf-8") as f:
@@ -113,10 +126,10 @@ def contains_any(text: str, keys: List[str]) -> bool:
 
 def classify_sentiment(title: str) -> str:
     t = title
-    if contains_any(t, BEAR_KEYS_STRONG): return "악재(강)"
-    if contains_any(t, BULL_KEYS_STRONG): return "호재(강)"
-    if contains_any(t, BEAR_KEYS):       return "악재(보통)"
-    if contains_any(t, BULL_KEYS):       return "호재(보통)"
+    if contains_any(t, list(BEAR_KEYS_STRONG)): return "악재(강)"
+    if contains_any(t, list(BULL_KEYS_STRONG)): return "호재(강)"
+    if contains_any(t, list(BEAR_KEYS)):       return "악재(보통)"
+    if contains_any(t, list(BULL_KEYS)):       return "호재(보통)"
     return "중립"
 
 # ========= Google News RSS =========
@@ -189,7 +202,8 @@ def fetch_dart_list_by_name(name: str) -> List[Item]:
 def render_items_grouped(items: List[Item]) -> str:
     groups = {"호재": [], "악재": [], "중립": []}
     for it in items:
-        key = "악재" if "악재" in classify_sentiment(it.title) else ("호재" if "호재" in classify_sentiment(it.title) else "중립")
+        cat = classify_sentiment(it.title)
+        key = "악재" if "악재" in cat else ("호재" if "호재" in cat else "중립")
         groups[key].append(f"- {it.stock} | {to_ts(it.ts)} | {it.title} | {it.url}")
     def join(k): return "\n".join(groups[k]) if groups[k] else "해당 없음"
     return f"[호재]\n{join('호재')}\n\n[악재]\n{join('악재')}\n\n[중립]\n{join('중립')}"
@@ -249,10 +263,10 @@ def main():
         for stock in WATCH_LIST:
             try:
                 for it in fetch_google_news(stock):
-                    if minutes_ago(it.ts) > MAX_ARTICLE_AGE_MIN: 
+                    if minutes_ago(it.ts) > MAX_ARTICLE_AGE_MIN:
                         continue
                     h = make_hash(it.title, it.url)
-                    if h in state["seen_hashes"]: 
+                    if h in state["seen_hashes"]:
                         continue
                     state["seen_hashes"].append(h)
                     state["seen_hashes"] = state["seen_hashes"][-8000:]
@@ -264,10 +278,10 @@ def main():
         for stock in WATCH_LIST:
             try:
                 for it in fetch_dart_list_by_name(stock):
-                    if minutes_ago(it.ts) > MAX_ARTICLE_AGE_MIN: 
+                    if minutes_ago(it.ts) > MAX_ARTICLE_AGE_MIN:
                         continue
                     h = make_hash(it.title, it.url)
-                    if h in state["seen_hashes"]: 
+                    if h in state["seen_hashes"]:
                         continue
                     state["seen_hashes"].append(h)
                     state["seen_hashes"] = state["seen_hashes"][-8000:]
@@ -282,36 +296,75 @@ def main():
                 tag = "악재" if "악재" in cat else "호재"
                 emoji = "⚠️" if tag == "악재" else "✅"
                 msg = f"[속보]{emoji} [{tag}] {it.stock}\n• 제목: {it.title}\n• 시각: {to_ts(it.ts)}\n{it.url}"
-                try: send_telegram(msg)
-                except Exception as e: print("[텔레그램 오류-속보]", e)
+                try:
+                    send_telegram(msg)
+                except Exception as e:
+                    print("[텔레그램 오류-속보]", e)
 
-        # 4) 다이제스트 버퍼(최근 1시간만 유지)
+        # 4) 다이제스트 버퍼(최근 1시간만 유지) — datetime 비교로 정리
         cutoff = now() - dt.timedelta(minutes=DIGEST_INTERVAL_MIN)
-        state["digest_buffer"] = [d for d in state.get("digest_buffer", []) if d.get("ts") and d["ts"] >= cutoff.isoformat()]
+        buf = []
+        for d in state.get("digest_buffer", []):
+            try:
+                if iso_to_dt(d["ts"]) >= cutoff:
+                    buf.append(d)
+            except Exception:
+                pass
+        state["digest_buffer"] = buf
+
         for it in newly:
             if it.ts >= cutoff:
-                state["digest_buffer"].append({"ts": it.ts.isoformat(), "src": it.source, "stock": it.stock, "title": it.title, "url": it.url})
+                state["digest_buffer"].append({
+                    "ts": it.ts.isoformat(),
+                    "src": it.source,
+                    "stock": it.stock,
+                    "title": it.title,
+                    "url": it.url
+                })
 
-        # 5) 다이제스트(1시간 간격 + 있을 때만)
+        # 5) 다이제스트(1시간 간격 + 있을 때만 + 중복/중립 필터)
         now_unix = int(time.time())
         need_digest = (now_unix - last_digest_unix >= DIGEST_INTERVAL_MIN * 60) and (len(state["digest_buffer"]) > 0)
+
         if need_digest:
-            items = [Item(ts=dt.datetime.fromisoformat(d["ts"]), source=d["src"], stock=d["stock"], title=d["title"], url=d["url"], raw={})
-                     for d in state["digest_buffer"]]
+            items = []
             cutoff2 = now() - dt.timedelta(minutes=DIGEST_INTERVAL_MIN)
-            items = [x for x in items if x.ts >= cutoff2]
-            if items:
-                items.sort(key=lambda x: (x.stock, x.ts))
+            for d in state["digest_buffer"]:
                 try:
-                    summary = gpt_digest_summarize(items)
-                    send_telegram("📰 [다이제스트] 지난 1시간 새 소식\n\n" + summary)
-                except Exception as e:
-                    print("[GPT/다이제스트 오류]", e)
+                    ts = iso_to_dt(d["ts"])
+                    if ts >= cutoff2:
+                        items.append(Item(ts=ts, source=d["src"], stock=d["stock"], title=d["title"], url=d["url"], raw={}))
+                except Exception:
+                    continue
+
+            # (A) 완전 무소식이면 전송 스킵
+            if not items:
+                print("[SKIP] 지난 1시간 새 소식 없음 → 다이제스트 전송하지 않음")
+            else:
+                # (B) 모두 '중립'이면 스킵 (옵션)
+                if SKIP_IF_ONLY_NEUTRAL and all(classify_sentiment(i.title) == "중립" for i in items):
+                    print("[SKIP] 지난 1시간 모두 중립 → 다이제스트 전송하지 않음")
+                else:
+                    # (C) 직전 다이제스트와 동일하면 스킵
+                    cur_hash = hash_items(items)
+                    if state.get("last_digest_hash", "") == cur_hash:
+                        print("[SKIP] 직전 다이제스트와 동일 → 전송하지 않음")
+                    else:
+                        try:
+                            items.sort(key=lambda x: (x.stock, x.ts))
+                            summary = gpt_digest_summarize(items)
+                            send_telegram("📰 [다이제스트] 지난 1시간 새 소식\n\n" + summary)
+                            state["last_digest_hash"] = cur_hash
+                        except Exception as e:
+                            print("[GPT/다이제스트 오류]", e)
+
+            # 윈도우 리셋
             state["digest_buffer"] = []
             last_digest_unix = now_unix
             state["last_digest_unix"] = last_digest_unix
 
         save_state(state)
+
         # 6) 슬립
         elapsed = time.time() - loop_start
         time.sleep(max(5, POLL_INTERVAL_SEC - int(elapsed)))
