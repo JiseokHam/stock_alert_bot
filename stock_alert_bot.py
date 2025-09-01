@@ -1,7 +1,7 @@
 # stock_alert_bot.py
+# 수정: pubDate 기반 "최근 기사" 알림 + 24시간까지 허용(재탕/중복 차단 강화)
+# 모드: 하이브리드(속보 즉시 + 1시간 다이제스트 "있을 때만")
 # 소스: Google News RSS + DART(전자공시)
-# 모드: 속보 즉시 + 1시간 다이제스트(새 소식 있을 때만)
-# 수정: 빈 다이제스트/중복 전송 방지, datetime 비교로 버그 제거
 
 import os, time, json, re, hashlib, zipfile, io, datetime as dt
 from dataclasses import dataclass
@@ -11,30 +11,26 @@ import feedparser
 from openai import OpenAI
 from dotenv import load_dotenv
 
-# ========= 환경설정(.env) =========
+# ========= 환경설정 =========
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID         = os.getenv("CHAT_ID")
 DART_API_KEY    = os.getenv("DART_API_KEY")
+
 if not (OPENAI_API_KEY and TELEGRAM_TOKEN and CHAT_ID and DART_API_KEY):
     raise SystemExit("환경변수(.env) 누락: OPENAI_API_KEY / TELEGRAM_TOKEN / CHAT_ID / DART_API_KEY 확인")
 
-TZ = dt.timezone(dt.timedelta(hours=9))  # Asia/Seoul
+TZ = dt.timezone(dt.timedelta(hours=9))  # Asia/Seoul (+09:00)
 
-# ========= 옵션 =========
-# 모두 '중립'만 있으면 다이제스트도 보내지 않으려면 True
-SKIP_IF_ONLY_NEUTRAL = True
-
-# ========= 모니터링 종목 =========
+# === 모니터링 종목 ===
 WATCH_LIST = [
-    "삼성전자",
-    # "대원산업",
-    # "현대코퍼레이션홀딩스",
-    # "삼지전자",
+    "대원산업",
+    "현대코퍼레이션홀딩스",
+    "삼지전자",
 ]
 
-# ========= 키워드(즉시 속보 트리거/분류) =========
+# === 강력 키워드(즉시 속보 트리거) ===
 BULL_KEYS_STRONG = [
     "무상증자", "자사주 매입", "배당 확대", "고배당", "특허 취득",
     "신제품", "지수 편입", "정부 정책", "경영권 분쟁 승소", "액면분할",
@@ -46,16 +42,19 @@ BEAR_KEYS_STRONG = [
     "실적 악화", "가이던스 하향", "규제 강화", "환율 부담",
     "원자재 가격 상승", "소송", "횡령", "배임", "거래정지",
     "상장적격성", "대량 매도", "임원 매도", "최대주주 매도",
+    # 추가: 세무 이슈를 강 악재로 취급
+    "세무조사", "국세청", "특별세무조사",
 ]
+
 BULL_KEYS = set(BULL_KEYS_STRONG + ["수주", "공급 계약", "사업 제휴", "인증 획득", "수혜", "테마"])
 BEAR_KEYS = set(BEAR_KEYS_STRONG + ["리콜", "계약 해지", "손상차손", "파기", "벌금", "제재", "압수수색"])
 
-# ========= 주기/필터 =========
-POLL_INTERVAL_SEC    = 120   # 2분 폴링
-DIGEST_INTERVAL_MIN  = 60    # 1시간 다이제스트(있을 때만 전송)
-MAX_ARTICLE_AGE_MIN  = 90    # RSS pubDate가 현재로부터 90분 이내만 새 소식으로 인정
+# === 주기/필터 설정 ===
+POLL_INTERVAL_SEC    = 120   # 2분
+DIGEST_INTERVAL_MIN  = 60    # 1시간 (있을 때만 전송)
+MAX_ARTICLE_AGE_MIN  = 1440  # <-- 24시간(어제 기사까지 허용)
 
-# ========= 파일 경로 =========
+# === 경로 ===
 STATE_PATH     = "state.json"
 CORP_MAP_PATH  = "dart_corp_codes.json"
 
@@ -63,7 +62,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 @dataclass
 class Item:
-    ts: dt.datetime     # 게시시각 (TZ 포함)
+    ts: dt.datetime     # 게시시각 (RSS pubDate or 공시 시각)
     source: str         # "news" | "dart"
     stock: str
     title: str
@@ -76,29 +75,22 @@ def now():
 def to_ts(d: dt.datetime | None):
     return (d or now()).strftime("%Y-%m-%d %H:%M")
 
-def iso_to_dt(s: str) -> dt.datetime:
-    # Python 3.11: fromisoformat이 TZ 포함 문자열 처리
-    return dt.datetime.fromisoformat(s)
-
 # ========= 유틸 =========
 def normalize_title(s: str) -> str:
+    # 재탕/중복 방지용: 소문자 + 특수문자/공백 축소
     s = s.lower()
     s = re.sub(r"\s+", " ", s)
     s = re.sub(r"[^\w가-힣%+–—\-·\s]", "", s)
     return s.strip()
 
 def make_hash(title: str, url: str):
+    # 제목정규화 + URL 조합으로 중복 방지 강화
     base = normalize_title(title) + "|" + (url or "")
     h = hashlib.sha256(base.encode("utf-8")).hexdigest()
     return h[:24]
 
 def minutes_ago(ts: dt.datetime) -> float:
     return (now() - ts).total_seconds() / 60.0
-
-def hash_items(items: List[Item]) -> str:
-    # 같은 내용 재발송 방지용 해시
-    key = "|".join(sorted(f"{normalize_title(i.title)}|{i.url}" for i in items))
-    return hashlib.md5(key.encode("utf-8")).hexdigest()
 
 # ========= 텔레그램 =========
 def send_telegram(text: str):
@@ -109,63 +101,90 @@ def send_telegram(text: str):
         print("TELEGRAM ERROR:", r.status_code, r.text)
     r.raise_for_status()
 
-# ========= 상태 파일 =========
+# ========= 상태 저장 =========
 def load_state():
     if os.path.exists(STATE_PATH):
         with open(STATE_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {"seen_hashes": [], "digest_buffer": [], "last_digest_unix": 0, "last_digest_hash": ""}
+    return {
+        "seen_hashes": [],
+        "digest_buffer": [],
+        "last_digest_unix": 0,
+    }
 
 def save_state(state):
     with open(STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
-# ========= 분류 로직 =========
+# ========= 분류 =========
 def contains_any(text: str, keys: List[str]) -> bool:
     return any(k in text for k in keys)
 
 def classify_sentiment(title: str) -> str:
     t = title
-    if contains_any(t, list(BEAR_KEYS_STRONG)): return "악재(강)"
-    if contains_any(t, list(BULL_KEYS_STRONG)): return "호재(강)"
-    if contains_any(t, list(BEAR_KEYS)):       return "악재(보통)"
-    if contains_any(t, list(BULL_KEYS)):       return "호재(보통)"
+    if contains_any(t, BEAR_KEYS_STRONG):
+        return "악재(강)"
+    if contains_any(t, BULL_KEYS_STRONG):
+        return "호재(강)"
+    if contains_any(t, BEAR_KEYS):
+        return "악재(보통)"
+    if contains_any(t, BULL_KEYS):
+        return "호재(보통)"
     return "중립"
 
-# ========= Google News RSS =========
+# ========= 뉴스 (Google News RSS) =========
 def fetch_google_news(stock: str) -> List[Item]:
     q = requests.utils.quote(stock)
     rss_url = f"https://news.google.com/rss/search?q={q}&hl=ko&gl=KR&ceid=KR:ko"
     feed = feedparser.parse(rss_url)
-    out: List[Item] = []
+    items: List[Item] = []
     for e in feed.entries[:30]:
+        # 반드시 RSS pubDate 사용
         if not hasattr(e, "published_parsed") or not e.published_parsed:
-            continue  # pubDate 없는 건 스킵
+            # 게시시각 불명 → 스킵 (재탕/오래된 기사 오탐 방지)
+            continue
         pub_ts = dt.datetime.fromtimestamp(time.mktime(e.published_parsed), tz=TZ)
-        if minutes_ago(pub_ts) > MAX_ARTICLE_AGE_MIN:
-            continue  # 오래된/재탕 기사 컷
-        out.append(Item(ts=pub_ts, source="news", stock=stock, title=e.title, url=e.link, raw={"entry": e}))
-    return out
 
-# ========= DART(전자공시) =========
+        # 오래된 기사 필터
+        if minutes_ago(pub_ts) > MAX_ARTICLE_AGE_MIN:
+            continue
+
+        title = e.title
+        link = e.link
+
+        items.append(Item(
+            ts=pub_ts,
+            source="news",
+            stock=stock,
+            title=title,
+            url=link,
+            raw={"entry": e}
+        ))
+    return items
+
+# ========= DART (전자공시) =========
 def ensure_dart_corp_map():
     if os.path.exists(CORP_MAP_PATH):
         with open(CORP_MAP_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
 
     url = f"https://opendart.fss.or.kr/api/corpCode.xml?crtfc_key={DART_API_KEY}"
-    r = requests.get(url, timeout=30); r.raise_for_status()
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
     z = zipfile.ZipFile(io.BytesIO(r.content))
-    xml = z.read("CORPCODE.xml").decode("utf-8", errors="ignore")
+    xml_bytes = z.read("CORPCODE.xml")
+    xml_text = xml_bytes.decode("utf-8", errors="ignore")
 
     pat = re.compile(r"<list>\s*<corp_code>(?P<code>\d+)</corp_code>\s*<corp_name>(?P<name>.*?)</corp_name>", re.S)
-    mp = {}
-    for m in pat.finditer(xml):
-        mp[m.group("name").strip()] = m.group("code").strip()
+    corp_map = {}
+    for m in pat.finditer(xml_text):
+        name = m.group("name").strip()
+        code = m.group("code").strip()
+        corp_map[name] = code
 
     with open(CORP_MAP_PATH, "w", encoding="utf-8") as f:
-        json.dump(mp, f, ensure_ascii=False, indent=2)
-    return mp
+        json.dump(corp_map, f, ensure_ascii=False, indent=2)
+    return corp_map
 
 def fetch_dart_list_by_name(name: str) -> List[Item]:
     corp_map = ensure_dart_corp_map()
@@ -173,49 +192,74 @@ def fetch_dart_list_by_name(name: str) -> List[Item]:
     if not corp_code:
         for n, c in corp_map.items():
             if name in n:
-                corp_code = c; break
+                corp_code = c
+                break
     if not corp_code:
         return []
 
     today = now().strftime("%Y%m%d")
-    params = {"crtfc_key": DART_API_KEY, "corp_code": corp_code, "bgn_de": today, "page_no": 1, "page_count": 100}
-    r = requests.get("https://opendart.fss.or.kr/api/list.json", params=params, timeout=20)
-    data = r.json(); out = []
-    if data.get("status") != "000": return out
+    params = {
+        "crtfc_key": DART_API_KEY,
+        "corp_code": corp_code,
+        "bgn_de": today,
+        "page_no": 1,
+        "page_count": 100,
+    }
+    url = "https://opendart.fss.or.kr/api/list.json"
+    r = requests.get(url, params=params, timeout=20)
+    data = r.json()
+    items = []
+    if data.get("status") != "000":
+        return items
 
     for row in data.get("list", []):
-        rcp_no = row.get("rcept_no"); 
-        if not rcp_no: continue
+        title = row.get("report_nm", "")
+        rcp_no = row.get("rcept_no")
+        if not rcp_no:
+            continue
         link = f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcp_no}"
+
         ts = now()
-        if row.get("rcept_dt") and row["rcept_dt"].isdigit():
+        if row.get("rcept_dt") and row.get("rcept_dt").isdigit():
+            dts = row["rcept_dt"]
             hhmmss = row.get("rcept_tm", "000000")
             try:
-                ts = dt.datetime.strptime(row["rcept_dt"] + hhmmss, "%Y%m%d%H%M%S").replace(tzinfo=TZ)
-            except: pass
+                ts = dt.datetime.strptime(dts + hhmmss, "%Y%m%d%H%M%S").replace(tzinfo=TZ)
+            except:
+                pass
+
         if minutes_ago(ts) > MAX_ARTICLE_AGE_MIN:
             continue
-        out.append(Item(ts=ts, source="dart", stock=name, title=row.get("report_nm",""), url=link, raw=row))
-    return out
 
-# ========= 다이제스트 보조 =========
+        items.append(Item(ts=ts, source="dart", stock=name, title=title, url=link, raw=row))
+    return items
+
+# ========= 다이제스트 보조(그룹핑) =========
 def render_items_grouped(items: List[Item]) -> str:
     groups = {"호재": [], "악재": [], "중립": []}
     for it in items:
         cat = classify_sentiment(it.title)
         key = "악재" if "악재" in cat else ("호재" if "호재" in cat else "중립")
         groups[key].append(f"- {it.stock} | {to_ts(it.ts)} | {it.title} | {it.url}")
-    def join(k): return "\n".join(groups[k]) if groups[k] else "해당 없음"
-    return f"[호재]\n{join('호재')}\n\n[악재]\n{join('악재')}\n\n[중립]\n{join('중립')}"
+
+    def join(k):
+        return "\n".join(groups[k]) if groups[k] else "해당 없음"
+
+    return (
+        f"[호재]\n{join('호재')}\n\n"
+        f"[악재]\n{join('악재')}\n\n"
+        f"[중립]\n{join('중립')}"
+    )
 
 # ========= GPT 요약(다이제스트) =========
 def gpt_digest_summarize(items: List[Item]) -> str:
-    grouped = render_items_grouped(items)
+    grouped_text = render_items_grouped(items)
     ts_label = now().strftime("%Y-%m-%d %H:%M")
+
     prompt = f"""
 너는 한국 주식 뉴스를 분류/요약하는 애널리스트다.
 아래 입력(지난 1시간 내 새 이슈)을 바탕으로, 보기 좋은 리포트를 한국어로 작성해라.
-형식은 아래와 완전히 동일하게 지켜라.
+형식은 아래와 완전히 동일하게 지켜라. (불필요한 말 금지)
 
 [요구 형식]
 🕒 기준시각: {ts_label}
@@ -237,7 +281,7 @@ def gpt_digest_summarize(items: List[Item]) -> str:
 - 단기 관점: 1~2줄
 
 [참고 데이터]
-{grouped}
+{grouped_text}
 """
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -253,16 +297,17 @@ def gpt_digest_summarize(items: List[Item]) -> str:
 def main():
     state = load_state()
     last_digest_unix = state.get("last_digest_unix", 0)
-    print("▶ 모니터링 시작… (Ctrl+C 종료)")
 
+    print("▶ 모니터링 시작… (Ctrl+C 종료)")
     while True:
         loop_start = time.time()
-        newly: List[Item] = []
+        newly_found: List[Item] = []
 
-        # 1) 뉴스
+        # 1) 뉴스 폴링
         for stock in WATCH_LIST:
             try:
-                for it in fetch_google_news(stock):
+                news = fetch_google_news(stock)
+                for it in news:
                     if minutes_ago(it.ts) > MAX_ARTICLE_AGE_MIN:
                         continue
                     h = make_hash(it.title, it.url)
@@ -270,14 +315,15 @@ def main():
                         continue
                     state["seen_hashes"].append(h)
                     state["seen_hashes"] = state["seen_hashes"][-8000:]
-                    newly.append(it)
+                    newly_found.append(it)
             except Exception as e:
                 print("[뉴스 오류]", stock, e)
 
-        # 2) DART(금일)
+        # 2) DART 폴링(금일)
         for stock in WATCH_LIST:
             try:
-                for it in fetch_dart_list_by_name(stock):
+                lst = fetch_dart_list_by_name(stock)
+                for it in lst:
                     if minutes_ago(it.ts) > MAX_ARTICLE_AGE_MIN:
                         continue
                     h = make_hash(it.title, it.url)
@@ -285,89 +331,81 @@ def main():
                         continue
                     state["seen_hashes"].append(h)
                     state["seen_hashes"] = state["seen_hashes"][-8000:]
-                    newly.append(it)
+                    newly_found.append(it)
             except Exception as e:
                 print("[DART 오류]", stock, e)
 
-        # 3) 즉시 속보(강력 키워드)
-        for it in newly:
+        # 3) 즉시 알림(강력 키워드)
+        for it in newly_found:
             cat = classify_sentiment(it.title)
             if cat in ("악재(강)", "호재(강)"):
                 tag = "악재" if "악재" in cat else "호재"
                 emoji = "⚠️" if tag == "악재" else "✅"
-                msg = f"[속보]{emoji} [{tag}] {it.stock}\n• 제목: {it.title}\n• 시각: {to_ts(it.ts)}\n{it.url}"
+                msg = (
+                    f"[속보]{emoji} [{tag}] {it.stock}\n"
+                    f"• 제목: {it.title}\n"
+                    f"• 시각: {to_ts(it.ts)}\n"
+                    f"{it.url}"
+                )
                 try:
                     send_telegram(msg)
                 except Exception as e:
                     print("[텔레그램 오류-속보]", e)
 
-        # 4) 다이제스트 버퍼(최근 1시간만 유지) — datetime 비교로 정리
+        # 4) 다이제스트 버퍼 = 직전 1시간 내 항목만 유지
         cutoff = now() - dt.timedelta(minutes=DIGEST_INTERVAL_MIN)
-        buf = []
-        for d in state.get("digest_buffer", []):
-            try:
-                if iso_to_dt(d["ts"]) >= cutoff:
-                    buf.append(d)
-            except Exception:
-                pass
-        state["digest_buffer"] = buf
-
-        for it in newly:
+        state["digest_buffer"] = [
+            d for d in state.get("digest_buffer", [])
+            if d.get("ts") and d["ts"] >= cutoff.isoformat()
+        ]
+        for it in newly_found:
             if it.ts >= cutoff:
                 state["digest_buffer"].append({
                     "ts": it.ts.isoformat(),
                     "src": it.source,
                     "stock": it.stock,
                     "title": it.title,
-                    "url": it.url
+                    "url": it.url,
                 })
 
-        # 5) 다이제스트(1시간 간격 + 있을 때만 + 중복/중립 필터)
+        # 5) 다이제스트(1시간 간격 + 있을 때만)
         now_unix = int(time.time())
         need_digest = (now_unix - last_digest_unix >= DIGEST_INTERVAL_MIN * 60) and (len(state["digest_buffer"]) > 0)
 
         if need_digest:
-            items = []
+            items = [
+                Item(
+                    ts=dt.datetime.fromisoformat(d["ts"]),
+                    source=d["src"],
+                    stock=d["stock"],
+                    title=d["title"],
+                    url=d["url"],
+                    raw={}
+                )
+                for d in state["digest_buffer"]
+            ]
             cutoff2 = now() - dt.timedelta(minutes=DIGEST_INTERVAL_MIN)
-            for d in state["digest_buffer"]:
+            items = [x for x in items if x.ts >= cutoff2]
+
+            if items:
+                items.sort(key=lambda x: (x.stock, x.ts))
                 try:
-                    ts = iso_to_dt(d["ts"])
-                    if ts >= cutoff2:
-                        items.append(Item(ts=ts, source=d["src"], stock=d["stock"], title=d["title"], url=d["url"], raw={}))
-                except Exception:
-                    continue
+                    summary = gpt_digest_summarize(items)
+                    header = "📰 [다이제스트] 지난 1시간 새 소식"
+                    send_telegram(f"{header}\n\n{summary}")
+                except Exception as e:
+                    print("[GPT/다이제스트 오류]", e)
 
-            # (A) 완전 무소식이면 전송 스킵
-            if not items:
-                print("[SKIP] 지난 1시간 새 소식 없음 → 다이제스트 전송하지 않음")
-            else:
-                # (B) 모두 '중립'이면 스킵 (옵션)
-                if SKIP_IF_ONLY_NEUTRAL and all(classify_sentiment(i.title) == "중립" for i in items):
-                    print("[SKIP] 지난 1시간 모두 중립 → 다이제스트 전송하지 않음")
-                else:
-                    # (C) 직전 다이제스트와 동일하면 스킵
-                    cur_hash = hash_items(items)
-                    if state.get("last_digest_hash", "") == cur_hash:
-                        print("[SKIP] 직전 다이제스트와 동일 → 전송하지 않음")
-                    else:
-                        try:
-                            items.sort(key=lambda x: (x.stock, x.ts))
-                            summary = gpt_digest_summarize(items)
-                            send_telegram("📰 [다이제스트] 지난 1시간 새 소식\n\n" + summary)
-                            state["last_digest_hash"] = cur_hash
-                        except Exception as e:
-                            print("[GPT/다이제스트 오류]", e)
-
-            # 윈도우 리셋
             state["digest_buffer"] = []
             last_digest_unix = now_unix
             state["last_digest_unix"] = last_digest_unix
 
         save_state(state)
 
-        # 6) 슬립
+        # 6) 대기(2분 주기)
         elapsed = time.time() - loop_start
-        time.sleep(max(5, POLL_INTERVAL_SEC - int(elapsed)))
+        sleep_sec = max(5, POLL_INTERVAL_SEC - int(elapsed))
+        time.sleep(sleep_sec)
 
 if __name__ == "__main__":
     main()
